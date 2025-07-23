@@ -9,8 +9,9 @@
 #include <dirent.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <termios.h>
 
-#define MAX_PROCS 256
+#define MAX_PROCS 1024
 #define MAX_LOGO_LINES 128
 #define MAX_LINE_LEN 256
 
@@ -25,6 +26,7 @@ typedef struct {
     char cmd[64];
     float cpu;
     float mem;
+    int tty; // If has tty > treat as interactive
 } proc_t;
 
 void draw_bar(float p, int w) {
@@ -120,16 +122,26 @@ void update_state(proc_state_t *states, int *n, int pid, unsigned long long utim
     if (*n < MAX_PROCS) { states[*n].pid = pid; states[*n].prev_utime = utime; (*n)++; }
 }
 
-int cmp(const void *a,const void *b) {
+int cmp_mem(const void *a,const void *b) {
+    float diff = ((proc_t*)b)->mem - ((proc_t*)a)->mem;
+    return diff < 0 ? -1 : (diff > 0 ? 1 : 0);
+}
+int cmp_cpu(const void *a,const void *b) {
     float diff = ((proc_t*)b)->cpu - ((proc_t*)a)->cpu;
     return diff < 0 ? -1 : (diff > 0 ? 1 : 0);
+}
+int cmp_pid(const void *a,const void *b) {
+    return ((proc_t*)a)->pid - ((proc_t*)b)->pid;
+}
+int cmp_cmd(const void *a,const void *b) {
+    return strcmp(((proc_t*)a)->cmd, ((proc_t*)b)->cmd);
 }
 
 void get_top(proc_t *procs,int *count,int max,unsigned long long sys_prev,unsigned long long sys_now,
              proc_state_t *states,int *state_count,int cores) {
     DIR *dir = opendir("/proc"); if (!dir) return;
     struct dirent *e; int found = 0;
-    while ((e = readdir(dir)) && found < max) {
+    while ((e = readdir(dir))) {
         if (e->d_type != DT_DIR) continue;
         int pid = atoi(e->d_name); if (pid <= 0) continue;
 
@@ -139,7 +151,12 @@ void get_top(proc_t *procs,int *count,int max,unsigned long long sys_prev,unsign
         unsigned long long ut, st;
         fscanf(fp,"%*d %s %c",&comm,&state);
         for (int i = 0; i < 11; i++) fscanf(fp,"%*s");
-        fscanf(fp,"%llu %llu",&ut,&st); fclose(fp);
+        fscanf(fp,"%llu %llu",&ut,&st);
+        int tty_nr; fscanf(fp,"%*s %*s %*s %*s %*s %*s %*s %*s %*s %d", &tty_nr);
+        fclose(fp);
+
+        // Filter: if no tty, treat as daemon/system
+        if (tty_nr == 0) continue;
 
         struct stat stbuf; char p[128];
         snprintf(p,sizeof(p),"/proc/%d",pid); stat(p,&stbuf);
@@ -148,6 +165,7 @@ void get_top(proc_t *procs,int *count,int max,unsigned long long sys_prev,unsign
         snprintf(procs[found].user,31,"%s",pw?pw->pw_name:"?");
         snprintf(procs[found].cmd,63,"%s",comm);
         procs[found].pid = pid;
+        procs[found].tty = tty_nr;
 
         unsigned long long last = find_prev(states, *state_count, pid);
         update_state(states, state_count, pid, ut+st);
@@ -159,11 +177,21 @@ void get_top(proc_t *procs,int *count,int max,unsigned long long sys_prev,unsign
         procs[found].mem = (float)res * getpagesize() / 1024 / 1024;
 
         found++;
+        if (found >= max) break;
     }
     closedir(dir);
     *count = found;
-    qsort(procs, found, sizeof(proc_t), cmp);
 }
+
+// --- raw term ---
+void set_raw(struct termios *old) {
+    struct termios raw;
+    tcgetattr(0, old);
+    raw = *old;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(0, TCSANOW, &raw);
+}
+void restore_raw(struct termios *old) { tcsetattr(0, TCSANOW, old); }
 
 int main() {
     struct utsname sys; uname(&sys);
@@ -185,6 +213,11 @@ int main() {
             line[strcspn(line,"\n")] = 0; logo[logo_lines] = strdup(line); logo_lines++;
         } fclose(fp);
     }
+
+    struct termios old;
+    set_raw(&old);
+    int offset = 0;
+    int sort_mode = 1;
 
     while (1) {
         printf("\033[H\033[2J");
@@ -215,16 +248,43 @@ int main() {
         printf("\nBattery: "); draw_bar(cached_bat, 25); printf("\n");
 
         unsigned long long sys_now = get_total_jiffies();
-        proc_t top[10]; int num=0; get_top(top, &num, 10, sys_prev, sys_now, states, &state_count, cores);
+        proc_t top[MAX_PROCS]; int num=0; get_top(top, &num, MAX_PROCS, sys_prev, sys_now, states, &state_count, cores);
         sys_prev = sys_now;
 
+        if (sort_mode == 1) qsort(top, num, sizeof(proc_t), cmp_cpu);
+        else if (sort_mode == 2) qsort(top, num, sizeof(proc_t), cmp_mem);
+        else if (sort_mode == 3) qsort(top, num, sizeof(proc_t), cmp_pid);
+        else qsort(top, num, sizeof(proc_t), cmp_cmd);
+
         printf("\n%-6s %-8s %-6s %-6s %-s\n","PID","USER","CPU%","MEM(MB)","CMD");
-        for (int i = 0; i < num; i++)
+        int show = 11;
+        if (offset > num - show) offset = num - show; if (offset < 0) offset = 0;
+        for (int i = offset; i < offset + show && i < num; i++)
             printf("%-6d %-8s %-6.1f %-8.1f %s\n",
                 top[i].pid, top[i].user, top[i].cpu, top[i].mem, top[i].cmd);
 
-        fflush(stdout); usleep(500000);
+        printf("\n[F1:CPU] [F2:MEM] [F3:PID] [F4:CMD]  [↑↓:Scroll]\n");
+
+        fflush(stdout);
+
+        usleep(100000);
+
+        if (read(0, &(char){0}, 1) == 1) {
+            char c; read(0,&c,1);
+            if (c == '[') {
+                read(0,&c,1);
+                if (c == 'A') offset--;
+                else if (c == 'B') offset++;
+            } else if (c == 'O') { // Function keys: ESC O P = F1
+                read(0,&c,1);
+                if (c == 'P') sort_mode = 1;
+                else if (c == 'Q') sort_mode = 2;
+                else if (c == 'R') sort_mode = 3;
+                else if (c == 'S') sort_mode = 4;
+            }
+        }
     }
+
+    restore_raw(&old);
     return 0;
 }
-
