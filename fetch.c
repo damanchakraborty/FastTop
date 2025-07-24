@@ -10,6 +10,9 @@
 #include <pwd.h>
 #include <sys/stat.h>
 #include <termios.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 
 #define MAX_PROCS 1024
 #define MAX_LOGO_LINES 128
@@ -220,6 +223,18 @@ int main() {
     int sort_mode = 1;
 
     while (1) {
+    struct winsize ws;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+    if (ws.ws_col < 116 || ws.ws_row < 47) {
+        printf("\033[H\033[2J");
+        printf("\n[!] Terminal window too small!\n");
+        printf("    Minimum: 116 cols x 47 rows\n");
+        printf("    Current: %d cols x %d rows\n", ws.ws_col, ws.ws_row);
+        printf("    Please resize your terminal.\n");
+        fflush(stdout);
+        usleep(500000);
+        continue;
+        }
         printf("\033[H\033[2J");
         int lines = cores + 6; int max_lines = lines > logo_lines ? lines : logo_lines;
         for (int i = 0; i < max_lines; i++) {
